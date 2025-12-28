@@ -6,6 +6,7 @@ using WebDriverManager.DriverConfigs.Impl;
 using HtmlAgilityPack;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace FaceBookAdLibraryCrawler
 {
@@ -20,12 +21,21 @@ namespace FaceBookAdLibraryCrawler
 
         static async Task Main(string[] args)
         {
+            //string whatToSearch = "Nike";
+           // int takeEntity = 500;
             Console.WriteLine("Please enter keyword to search . Exmaple : Nike");
             var whatToSearch = Console.ReadLine();
-            Console.WriteLine("The Crawler will select 5 items for you.");
+
+            Console.WriteLine("How many items would you like to select?");
+            if (!int.TryParse(Console.ReadLine(), out int takeEntity)) takeEntity = 5;
+
             if (string.IsNullOrEmpty(whatToSearch)) return;
+
+            Stopwatch totalOpTimer = Stopwatch.StartNew();
+            Stopwatch setupTimer = Stopwatch.StartNew();
+
             string searchUrl = $"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&is_targeted_country=false&media_type=all&q={whatToSearch}&search_type=keyword_unordered";
-            // searchUrl = "https://google.com";
+
             try
             {
                 Console.WriteLine("Going to set up the driver");
@@ -47,31 +57,52 @@ namespace FaceBookAdLibraryCrawler
                 Console.WriteLine("Going to open web driver");
                 WebDriverWait wait = new WebDriverWait(_driver, TimeSpan.FromSeconds(15));
                 Console.WriteLine("Waiting to find the starting element");
+
                 int remainingAttempts = 5;
-                while (remainingAttempts>0)
+                while (remainingAttempts > 0)
                 {
                     try
                     {
                         wait.Until(driver => driver.FindElement(By.XPath(stableXPathSelector)));
                         break;
                     }
-                    catch (Exception e)
+                    catch (Exception)
                     {
                         remainingAttempts--;
                     }
                 }
+
+                setupTimer.Stop();
+                PrintFormattedTime("Base Setup", setupTimer.Elapsed);
+
                 int totalResults = GetTotalResults();
                 Console.WriteLine($"Found {totalResults:N0} active items for '{whatToSearch}'.");
+                Console.WriteLine("We assume that there are 15 items per scroll");
+                await ScrollUntilLoaded(takeEntity);
 
-                await Scroll();
-
-                HtmlDocument? doc = GetHtmlDocument();
+                HtmlDocument doc = GetHtmlDocument();
 
                 if (doc != null)
                 {
                     Console.WriteLine("HTML content fetched and ready for parsing with HtmlAgilityPack.");
                 }
-                var cards =  await ParseAdCards(doc, 5);
+
+                Stopwatch extractionTimer = Stopwatch.StartNew();
+                var cards = await ParseAdCards(doc, takeEntity);
+                await WriteInFile(cards);
+                extractionTimer.Stop();
+
+                totalOpTimer.Stop();
+
+                Console.WriteLine("\n--- Performance Metrics ---");
+                PrintFormattedTime("Full Operation", totalOpTimer.Elapsed);
+
+                if (cards.Count > 0)
+                {
+                    double avgTicks = (double)extractionTimer.Elapsed.Ticks / cards.Count;
+                    TimeSpan avgTime = TimeSpan.FromTicks((long)avgTicks);
+                    Console.WriteLine($"Average time per extraction: {avgTime.TotalSeconds:F2} seconds");
+                }
             }
             catch (WebDriverTimeoutException)
             {
@@ -92,89 +123,161 @@ namespace FaceBookAdLibraryCrawler
             }
         }
 
-        static int GetTotalResults()
+        static void PrintFormattedTime(string label, TimeSpan ts)
         {
-            const string stableXPathSelector = "//div[@role='heading' and @aria-level='3']";
-
-            IWebElement resultElement = _driver.FindElement(By.XPath(stableXPathSelector));
-            string rawResultText = resultElement.Text;
-
-            if (string.IsNullOrEmpty(rawResultText))
+            if (ts.TotalSeconds > 60)
             {
-                return 0;
-            }
-
-            string numericText = Regex.Replace(rawResultText, @"[^\d,]", "").Replace(",", "");
-
-            if (int.TryParse(numericText, out int resultCount))
-            {
-                return resultCount;
+                Console.WriteLine($"{label} Time: {ts.Minutes}m {ts.Seconds}s");
             }
             else
             {
-                Console.WriteLine($"Warning: Could not parse result count text: '{rawResultText}'");
-                return 0;
+                Console.WriteLine($"{label} Time: {ts.TotalSeconds:F2}s");
             }
         }
 
-        static async Task<List<AdCard>> ParseAdCards(HtmlDocument doc, int takeEntity,int remainingTries=5)
+        static int GetTotalResults()
+        {
+            const string stableXPathSelector = "//div[@role='heading' and @aria-level='3']";
+            IWebElement resultElement = _driver.FindElement(By.XPath(stableXPathSelector));
+            string rawResultText = resultElement.Text;
+            if (string.IsNullOrEmpty(rawResultText)) return 0;
+            string numericText = Regex.Replace(rawResultText, @"[^\d,]", "").Replace(",", "");
+            return int.TryParse(numericText, out int resultCount) ? resultCount : 0;
+        }
+
+        static async Task WriteInFile(List<AdCard> cards)
+        {
+            try
+            {
+                var lines = new List<string>
+        {
+            "index,libraryId"
+        };
+
+                lines.AddRange(
+                    cards.Select((card, index) => $"{index + 1},{card.LibraryID}")
+                );
+
+                await File.WriteAllLinesAsync("output.txt", lines);
+                Console.WriteLine($"file saved at {Path.Combine(Directory.GetCurrentDirectory(), "output.txt")}");
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"failed to write file : {e.Message}");
+            }
+        }
+
+        static async Task<List<AdCard>> ParseAdCards(HtmlDocument doc, int takeEntity)
         {
             var adList = new List<AdCard>();
+            const string parentClasses = "xrvj5dj x18m771g x1p5oq8j xp48ta0 x18d9i69 xtssl2i xtqikln x1na6gtj xjewof7 x1l48g3s x1vql8b3 x1m5622i";
+            var parentNode = doc.DocumentNode.SelectSingleNode($"//div[contains(@class, '{parentClasses}')]");
 
-            const string adCardXPath = "//div[contains(@class, 'xh8yej3')]";
-
-            var adNodes = doc.DocumentNode.SelectNodes(adCardXPath);
-
-            if (adNodes == null)
+            if (parentNode == null)
             {
-                Console.WriteLine("No ad cards found with the primary selector.");
+                Console.WriteLine("DEBUG: Parent results container not found.");
+                return adList;
+            }
+            var adNodes = parentNode.SelectNodes(".//div[@class='xh8yej3'][div[1][contains(@class, 'x1plvlek')]]"); if (adNodes == null)
+            {
+                Console.WriteLine("DEBUG: No ad card nodes found inside parent.");
                 return adList;
             }
             if (adNodes.Count < takeEntity)
             {
                 Console.WriteLine($"there are currently {adNodes.Count} ads on the page . Going to scroll again.");
-                await Scroll();
-                return await ParseAdCards(doc, takeEntity, remainingTries--);
+                await ScrollUntilLoaded(takeEntity);
+                doc = GetHtmlDocument();
+                return await ParseAdCards(doc, takeEntity);
             }
-            Console.WriteLine($"Found {adNodes.Count} ad cards. Starting extraction...");
 
-            foreach (var node in adNodes.Take(takeEntity))
+            var nodesToProcess = adNodes.Take(takeEntity).ToList();
+
+            for (int i = 0; i < nodesToProcess.Count; i++)
             {
-                var libraryIdParentNode = node.SelectSingleNode("//div[contains(@class, 'x1rg5ohu x67bb7w')]");
-                var libraryIdNode = libraryIdParentNode.FirstChild;
-                string libraryIDText = libraryIdNode?.InnerText.Trim() ?? "N/A";
-                string libraryID = libraryIDText.Replace("Library ID:", "").Trim();
+                var node = nodesToProcess[i];
+                string libraryID = "N/A";
 
-                Console.WriteLine($"--- Scanning Ad : {libraryIDText} ---");
+                string nodeHtml = node.InnerHtml;
 
-                
-                adList.Add(new AdCard
+                if (!string.IsNullOrEmpty(nodeHtml))
                 {
-                    LibraryID = libraryID,
-                   
-                });
-            }
 
+                    var match = Regex.Match(nodeHtml, @"Library ID:\s*(\d+)", RegexOptions.IgnoreCase);
+
+                    if (match.Success)
+                    {
+                        libraryID = match.Groups[1].Value;
+                    }
+                    else
+                    {
+                        Console.WriteLine("Direct 'Library ID' text not found in string. Checking for long numeric strings...");
+                        var longDigitMatch = Regex.Match(nodeHtml, @"\d{14,16}");
+                        if (longDigitMatch.Success)
+                        {
+                            libraryID = longDigitMatch.Value;
+                        }
+                    }
+                }
+
+                Console.WriteLine($"{i+1}. {libraryID}");
+                adList.Add(new AdCard { LibraryID = libraryID });
+            }
             return adList;
         }
 
-        static async Task Scroll()
+        static async Task<int> ScrollUntilLoaded(int targetCount, int timeoutSeconds = 300)
         {
-            const int scrollAttempts = 5;
             IJavaScriptExecutor js = (IJavaScriptExecutor)_driver;
-
-            Console.WriteLine($"Starting scroll loop ({scrollAttempts} times)...");
-
-            for (int i = 0; i < scrollAttempts; i++)
+            int currentDetected = 0;
+            int interval = 600;
+            var totalStopwatch = Stopwatch.StartNew();
+            int index = 0;
+            int remainingScrolls = targetCount / 15;
+            if (remainingScrolls < 1)
+                remainingScrolls = 1;
+            Console.WriteLine($"Calculated Scroll count : {remainingScrolls}");
+            while (totalStopwatch.Elapsed.TotalSeconds < timeoutSeconds)
             {
-                js.ExecuteScript("window.scrollTo(0, document.body.scrollHeight)");
+                var lapStopwatch = Stopwatch.StartNew();
+                js.ExecuteScript("window.scrollTo(0, document.body.scrollHeight);");
 
-                await Task.Delay(2000);
-                Console.WriteLine($"Scroll attempt {i + 1} complete.");
+                await Task.Delay(interval);
+                Console.WriteLine($"Scroll {index + 1} took: {lapStopwatch.Elapsed.TotalMilliseconds:F0}ms | Total: {totalStopwatch.Elapsed.TotalSeconds:F1}s");
+                index++;
+                if (remainingScrolls == 0)
+                {
+                    var doc = GetHtmlDocument();
+                    const string parentClasses = "xrvj5dj x18m771g x1p5oq8j xp48ta0 x18d9i69 xtssl2i xtqikln x1na6gtj xjewof7 x1l48g3s x1vql8b3 x1m5622i";
+                    var parentNode = doc.DocumentNode.SelectSingleNode($"//div[contains(@class, '{parentClasses}')]");
+
+                    if (parentNode != null)
+                    {
+                        var adNodes = parentNode.SelectNodes(".//div[@class='xh8yej3'][div[1][contains(@class, 'x1plvlek')]]");
+                        currentDetected = adNodes?.Count ?? 0;
+                    }
+
+                    Console.WriteLine($"Dynamic Scroll: Found {currentDetected}/{targetCount} ads... ");
+
+                    if (currentDetected >= targetCount)
+                    {
+                        Console.WriteLine("Target reached. Proceeding to extraction.");
+                        break;
+                    }
+                    else
+                    {
+                        remainingScrolls = (targetCount - currentDetected) / 15;
+                        if (remainingScrolls < 1)
+                            remainingScrolls = 1;
+                    }
+                }
+                remainingScrolls--;
+
             }
+            Console.WriteLine("Time out reached.Exiting loop");
+            return currentDetected;
         }
-
-        static HtmlDocument? GetHtmlDocument()
+        static HtmlDocument GetHtmlDocument()
         {
             string htmlContent = _driver.PageSource;
             var doc = new HtmlDocument();
